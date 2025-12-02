@@ -1,0 +1,28 @@
+{
+    "Model Details" : {
+      "description": "Confirguration for 1 Dev to 1 Prod Sync",
+      "export_action_name": "Model History Export",
+      "model_ids": [
+        {
+          "dev_model_id": "1CBADB91372248C7B1E4CABEA8F6FC55",
+          "prod_model_id": "8E97A8D57D9C4EF9A835154E8755DBB4"
+        },
+        {
+          "dev_model_id": "02AED78EA4A8472C8FFBDC2148FEC885",
+          "prod_model_id": "BFE488A7C5A44B2A919001AE960F9CA2"
+        },
+        {
+          "dev_model_id": "292EA6ED17B44A149851A9407FD4256A",
+          "prod_model_id": "56EA0562FA6D45A6952294A110193EC3"
+        },
+        {
+          "dev_model_id": "502A76A85EE847F190842BC86B149D54",
+          "prod_model_id": "098EF58923B74C4A8E4B82CDF489E3A4"
+        },
+        {
+          "dev_model_id": "45D008BE86544A17AF51349FED239234",
+          "prod_model_id": "936E7D2C5A384F3DB5DC3009FC3D19BE"
+        }
+      ]
+    }
+}
