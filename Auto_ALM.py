@@ -1,343 +1,4 @@
-#!/usr/bin/env python3
-"""
-Auto ALM sync script
-- Function-based, simple names, minimal important comments.
-- Interactive: collects input for each dev->prod pair, then runs confirmed syncs in parallel.
-Dependencies: requests
-"""
-
-import os
-import sys
-import shutil
-import json
-import logging
-import time
-from datetime import datetime
-from getpass import getpass
-from typing import List, Dict, Tuple, Any
-import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# -------------------------
-# Configuration / constants
-# -------------------------
-LOG_BACKUP_DIR = "Log_Backup"
-LOGS_DIR = "Logs"
-MODEL_HISTORY_DIR = "Model_History"
-CONFIG_FILE = "config.json"
-LOG_FILENAME_PREFIX = "Auto_ALM"
-MODEL_HISTORY_PREFIX = "MODEL_HISTORY"
-ANAPLAN_BASE = "https://api.anaplan.com"  # adjust if necessary
-REQUEST_TIMEOUT = 30  # seconds
-MAX_WORKERS = 4  # parallel workers for sync
-
-
-# -------------------------
-# Utility functions
-# -------------------------
-def ensure_dir(path: str):
-    if not os.path.exists(path):
-        os.makedirs(path)
-
-
-def timestamp_str() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
-# -------------------------
-# Logging & file helpers
-# -------------------------
-def archive_existing_logs(main_dir: str = ".", backup_dir: str = LOG_BACKUP_DIR) -> List[str]:
-    """
-    Move any .log files present in main_dir into backup_dir.
-    Return list of moved filenames (with dest path).
-    """
-    moved = []
-    ensure_dir(backup_dir)
-    # If backup_dir was just created, notify
-    if not os.listdir(backup_dir):
-        # If it's empty now and was just created, inform user
-        print(f"Created folder: {backup_dir}")
-
-    for entry in os.listdir(main_dir):
-        path = os.path.join(main_dir, entry)
-        if os.path.isfile(path) and entry.lower().endswith(".log"):
-            dest = os.path.join(backup_dir, entry)
-            shutil.move(path, dest)
-            print(f"Moved log file '{entry}' -> '{backup_dir}'")
-            moved.append(dest)
-    return moved
-
-
-def create_new_log(logs_dir: str = LOGS_DIR) -> Tuple[str, logging.Logger]:
-    ensure_dir(logs_dir)
-    fname = f"{LOG_FILENAME_PREFIX}_{timestamp_str()}.log"
-    filepath = os.path.join(logs_dir, fname)
-
-    logger = logging.getLogger("auto_alm")
-    logger.setLevel(logging.DEBUG)
-    logger.handlers.clear()
-
-    # File handler
-    fh = logging.FileHandler(filepath)
-    fh.setLevel(logging.DEBUG)
-    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-
-    # Console handler (info/warn)
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(logging.Formatter("%(message)s"))
-    logger.addHandler(ch)
-
-    logger.info(f"Log file created: {filepath}")
-    return filepath, logger
-
-
-# -------------------------
-# Config & input
-# -------------------------
-def load_config(path: str = CONFIG_FILE) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def parse_model_pairs(config: dict) -> Tuple[str, List[Dict[str, str]]]:
-    """
-    Return export_action_name and list of dicts {'dev':..., 'prod':...}
-    """
-    md = config.get("Model Details", {})
-    export_action_name = md.get("export_action_name", "").strip()
-    pairs = []
-    for entry in md.get("model_ids", []):
-        dev = entry.get("dev_model_id")
-        prod = entry.get("prod_model_id")
-        if dev and prod:
-            pairs.append({"dev": dev, "prod": prod})
-    return export_action_name, pairs
-
-
-def prompt_credentials() -> Tuple[str, str]:
-    user = input("Enter Anaplan username/email: ").strip()
-    # getpass masks input (no echo). Not showing '*' by default.
-    pwd = getpass("Enter Anaplan password (input hidden): ")
-    return user, pwd
-
-
-# -------------------------
-# Anaplan API helpers
-# -------------------------
-def authenticate_anaplan(username: str, password: str, logger: logging.Logger) -> str:
-    """
-    Authenticate to Anaplan and return token string.
-    This function uses Basic Auth to the Anaplan auth endpoint.
-    Keep token in-memory only. Do not write to logs.
-    """
-    logger.info("Authenticating to Anaplan...")
-    auth_url = f"{ANAPLAN_BASE}/2/0/authenticate"  # Anaplan's authenticate endpoint (v2)
-    try:
-        resp = requests.post(auth_url, auth=(username, password), timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 200:
-            # response typically contains token in JSON or headers - adapt as needed
-            # Many Anaplan flows return token in JSON: {"token": "..."}
-            try:
-                j = resp.json()
-                token = j.get("token") or j.get("authToken") or j.get("authorizationToken")
-            except Exception:
-                token = None
-            # fallback: header-based
-            if not token:
-                token = resp.headers.get("Authorization") or resp.headers.get("X-Auth-Token")
-            if not token:
-                logger.error("Authentication succeeded but token not found in response.")
-                raise RuntimeError("Auth token missing")
-            logger.info("Authentication successful.")
-            return token
-        else:
-            logger.error(f"Authentication failed (status {resp.status_code}): {resp.text}")
-            raise RuntimeError("Authentication failed")
-    except requests.RequestException as e:
-        logger.error(f"Authentication request failed: {e}")
-        raise
-
-
-def find_export_id_by_name(token: str, model_id: str, export_name: str, logger: logging.Logger) -> str:
-    """
-    Search exports of a model to find an export with given name.
-    Returns export id or raises.
-    """
-    headers = {"Authorization": f"AnaplanAuthToken {token}"}
-    url = f"{ANAPLAN_BASE}/2/0/models/{model_id}/exports"
-    try:
-        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        # data format may be {'exports': [{'id':..., 'name':...}, ...]}
-        exports = data.get("exports") or data.get("items") or []
-        for e in exports:
-            if e.get("name") == export_name:
-                return e.get("id")
-        raise RuntimeError(f"Export action '{export_name}' not found for model {model_id}")
-    except requests.RequestException as e:
-        logger.error(f"Failed to list exports for model {model_id}: {e}")
-        raise
-
-
-def run_export_and_download(token: str, model_id: str, export_id: str, out_dir: str, logger: logging.Logger) -> str:
-    """
-    Trigger export task and download result file into out_dir.
-    Returns file path of downloaded model history.
-    """
-    headers = {"Authorization": f"AnaplanAuthToken {token}"}
-    # 1) start export task
-    start_url = f"{ANAPLAN_BASE}/2/0/models/{model_id}/exports/{export_id}/tasks"
-    try:
-        resp = requests.post(start_url, headers=headers, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        task_info = resp.json()
-        task_id = task_info.get("task", {}).get("id") or task_info.get("id")
-        if not task_id:
-            logger.error("Export task id not found after starting export.")
-            raise RuntimeError("Export task id missing")
-        # 2) poll for completion and get result endpoint
-        task_url = f"{start_url}/{task_id}"
-        logger.info("Waiting for export task to complete...")
-        for _ in range(60):  # poll up to ~60*2 = 120s depending on sleep
-            t_resp = requests.get(task_url, headers=headers, timeout=REQUEST_TIMEOUT)
-            t_resp.raise_for_status()
-            tdata = t_resp.json()
-            status = (tdata.get("task") or tdata).get("status") if isinstance(tdata, dict) else None
-            if status in ("COMPLETED", "Success", "completed", "success"):
-                break
-            time.sleep(2)
-        # 3) fetch export result content
-        # Many Anaplan exports provide a download link; some provide content at tasks endpoint
-        download_url = f"{ANAPLAN_BASE}/2/0/models/{model_id}/exports/{export_id}/result"
-        dl = requests.get(download_url, headers=headers, timeout=REQUEST_TIMEOUT, stream=True)
-        dl.raise_for_status()
-        ensure_dir(out_dir)
-        fname = f"{model_id}_{timestamp_str()}.zip"
-        fpath = os.path.join(out_dir, fname)
-        with open(fpath, "wb") as fh:
-            for chunk in dl.iter_content(chunk_size=8192):
-                if chunk:
-                    fh.write(chunk)
-        logger.info(f"Downloaded model history: {fpath}")
-        return fpath
-    except requests.RequestException as e:
-        logger.error(f"Export/download failed for model {model_id}: {e}")
-        raise
-
-
-# -------------------------
-# Model history & revision helpers
-# -------------------------
-def download_model_history(token: str, dev_model_id: str, export_action_name: str, out_dir: str, logger: logging.Logger) -> str:
-    """
-    Find export by name for dev model, run it and download the result into out_dir.
-    Returns path to downloaded file.
-    """
-    try:
-        export_id = find_export_id_by_name(token, dev_model_id, export_action_name, logger)
-        return run_export_and_download(token, dev_model_id, export_id, out_dir, logger)
-    except Exception as e:
-        logger.error(f"Could not download model history for {dev_model_id}: {e}")
-        # Re-raise to let caller decide
-        raise
-
-
-def list_revision_tags(token: str, model_id: str, logger: logging.Logger) -> List[Dict[str, Any]]:
-    """
-    List revision tags for a model. Returns list of tags with name/id.
-    """
-    headers = {"Authorization": f"AnaplanAuthToken {token}"}
-    url = f"{ANAPLAN_BASE}/2/0/models/{model_id}/modelRevisions"  # approximate endpoint
-    try:
-        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        tags = data.get("revisions") or data.get("items") or []
-        return tags
-    except requests.RequestException:
-        logger.warning("Could not fetch revision tags (API may differ); returning empty list.")
-        return []
-
-
-def create_revision_tag(token: str, model_id: str, tag_name: str, logger: logging.Logger) -> Dict[str, Any]:
-    """
-    Create a new revision tag on the dev model.
-    Returns created tag info.
-    """
-    headers = {"Authorization": f"AnaplanAuthToken {token}", "Content-Type": "application/json"}
-    url = f"{ANAPLAN_BASE}/2/0/models/{model_id}/modelRevisions"  # approximate endpoint
-    payload = {"name": tag_name}
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.RequestException as e:
-        logger.error(f"Failed to create revision tag '{tag_name}' on {model_id}: {e}")
-        raise
-
-
-# -------------------------
-# Size estimation functions
-# -------------------------
-def get_workspace_usage(token: str, model_id: str, logger: logging.Logger) -> Tuple[int, int]:
-    """
-    Return (current_usage_bytes, allocation_bytes) for the workspace containing model_id.
-    This attempts to find workspace id and then query usage. Implementation depends on API structure.
-    """
-    headers = {"Authorization": f"AnaplanAuthToken {token}"}
-    # 1) find workspace id for model
-    try:
-        model_url = f"{ANAPLAN_BASE}/2/0/models/{model_id}"
-        resp = requests.get(model_url, headers=headers, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        mdata = resp.json().get("model") or resp.json()
-        workspace_id = mdata.get("workspace", {}).get("id") or mdata.get("workspaceId") or mdata.get("workspaceId")
-        if not workspace_id:
-            logger.warning("Workspace id not found in model metadata; size estimation may not be accurate.")
-            return 0, 0
-        # 2) request workspace usage
-        usage_url = f"{ANAPLAN_BASE}/2/0/workspaces/{workspace_id}/usage"
-        uresp = requests.get(usage_url, headers=headers, timeout=REQUEST_TIMEOUT)
-        uresp.raise_for_status()
-        udata = uresp.json()
-        used = udata.get("usedSpace") or udata.get("usedBytes") or udata.get("consumedBytes") or 0
-        alloc = udata.get("allocatedSpace") or udata.get("allocatedBytes") or udata.get("allocationBytes") or 0
-        return int(used), int(alloc)
-    except requests.RequestException:
-        logger.warning("Could not determine workspace usage via API; returning zeros.")
-        return 0, 0
-
-
-def estimate_post_sync_size(token: str, prod_model_id: str, revision_file_path: str, logger: logging.Logger) -> Dict[str, Any]:
-    """
-    Estimate size after applying RT using file size of downloaded revision as proxy.
-    Returns dict with current, after, pct_after (0-1).
-    """
-    current_used, allocation = get_workspace_usage(token, prod_model_id, logger)
-    revision_size = 0
-    try:
-        revision_size = os.path.getsize(revision_file_path)
-    except Exception:
-        logger.warning("Could not read revision file size; using 0 for estimation.")
-    after = current_used + revision_size
-    pct = (after / allocation) if allocation > 0 else 0.0
-    return {"current": current_used, "allocation": allocation, "after": after, "pct_after": pct, "revision_size": revision_size}
-
-
-# -------------------------
-# Per-pair interactive prompts
-# -------------------------
-def ask_revision_choice_for_pair(idx: int, dev: str, prod: str, token: str, logger: logging.Logger, revision_file_path: str) -> Dict[str, Any]:
-    """
-    Interactively ask user for this pair how they want to pick RT.
-    Returns dict with selection details.
-    """
-    print(f"\nPair #{idx + 1}: Dev={dev} -> Prod={prod}")
+Prod={prod}")
     logger.info(f"Processing pair #{idx + 1}: Dev={dev} -> Prod={prod}")
 
     # Ask user for choice
@@ -572,3 +233,33 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+import base64
+import requests
+
+def authenticate(username, password):
+    try:
+        # Create base64 token → username:password
+        raw = f"{username}:{password}"
+        encoded = base64.b64encode(raw.encode("utf-8")).decode("utf-8")
+        headers = {
+            "Authorization": f"Basic {encoded}",
+            "Accept": "application/json"
+        }
+
+        # Call Anaplan Auth API
+        url = "https://auth.anaplan.com/token/authenticate"
+        response = requests.post(url, headers=headers)
+
+        if response.status_code == 200:
+            token = response.json()["tokenInfo"]["tokenValue"]
+            print("✅ Authentication successful")
+            return token
+        else:
+            print(f"❌ Authentication failed: {response.status_code}")
+            print(response.text)
+            return None
+
+    except Exception as e:
+        print("❌ Error during authentication:", str(e))
+        return None
